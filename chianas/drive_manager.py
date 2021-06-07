@@ -425,12 +425,13 @@ def get_drive_by_mountpoint(mountpoint):
     This accepts a mountpoint ('/mnt/enclosure0/rear/column2/drive32') and returns the drive:
     drive32
     """
-    return (mountpoint.split("/")[5])
+    return (mountpoint.split("/")[3])
 
 def get_mountpoint_by_drive_number(drive):
     """
     This accepts a drive number (drive0) and returns the device assignment: /dev/sda1 and mountpoint:
     /mnt/enclosure0/front/column0/drive0
+    ks: changed to /mnt/enclosure0/drive0
     """
     partitions = psutil.disk_partitions(all=False)
     for p in partitions:
@@ -462,7 +463,7 @@ def get_device_by_mountpoint(mountpoint):
 
 def get_mountpoint_by_device(device):
     """
-        This accepts a mountpoint and returns the device assignment: /dev/sda1 and mountpoint
+        This accepts a device assignment and returns the mountpoint: /dev/sda1 and mountpoint
         """
     partitions = psutil.disk_partitions(all=False)
     for p in partitions:
@@ -485,6 +486,7 @@ def get_path_info_by_mountpoint(mountpoint, info):
     """
     This accepts a mountpoint ('/mnt/enclosure0/rear/column2/drive32') and returns the enclosure:
     enclosure1
+    ks: This is defined but not used.
     """
     if info == 'enclosure':
         return (mountpoint.split("/")[2])
