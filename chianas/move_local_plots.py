@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 
 __author__ = 'Richard J. Sears'
-VERSION = "0.92 (2021-05-31)"
+VERSION = "0.92 (2021-06-07)"
 
 # This script is part of my plot management set of tools. This
 # script is used to move plots from one location to another on
@@ -42,7 +42,7 @@ if testing:
     drive_check = script_path.joinpath('drive_stats.sh')
     drive_check_output = script_path.joinpath('drive_stats.io')
 else:
-    plot_dir = chianas.dst_dir # Where do you hold your plots before they are moved?
+    plot_dir = chianas.dst_dirs[0] # Where do you hold your plots before they are moved?
     plot_size = 108644374730  # Based on K32 plot size
     status_file = script_path.joinpath('local_transfer_job_running')
     drive_check = script_path.joinpath('drive_stats.sh')
@@ -187,7 +187,6 @@ def check_drive_activity():
         return False
     else:
         return True
-
 
 def main():
     are_we_configured()
