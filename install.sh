@@ -1,6 +1,6 @@
 #! /bin/bash
 
-# Version V0.92 2021-06-07
+# Version V0.95 2021-09-03
 
 # Simple Install script for NEW clean Ubuntu 20.04 install, updates
 # the system with various tools and tings required to run the various
@@ -141,9 +141,8 @@ clean_up_nas_directory(){
    mkdir -p /root/.config/plot_manager
    if test -f "/root/.config/plot_manager/plot_manager.yaml"; then
      echo -e  "/root/.config/plot_manager/plot_manager.yaml already exists....\n"
-     echo -e  "Making a backup...."
-     cp /root/.config/plot_manager/plot_manager.yaml /root/.config/plot_manager/plot_manager.yaml.backup
-     echo -e "Please make sure to check your settings!!!"
+     echo -e "Launching our ${blue}Configuration File Updater${nc} to see if updates are needed.......\n"
+     $current_directory/config_file_updater.py
     else
       cp $current_directory/plot_manager.skel.yaml /root/.config/plot_manager/plot_manager.yaml
       cp $current_directory/plot_manager.skel.yaml /root/.config/plot_manager/INSTRUCTIONS.yaml
@@ -155,6 +154,7 @@ clean_up_nas_directory(){
 clean_up_plot_directory(){
    echo -e "\n\n${green}Cleaning Up Directory Structure & Setting File Permissions.........${nc}\n"
    mv $current_directory/chiaplot/* $current_directory/
+   cp $current_directory/chianas/config_file_updater.py $current_directory
    rm -rf $current_directory/chiaplot
    rm -rf $current_directory/chianas
    rm -rf $current_directory/coin_monitor
@@ -165,9 +165,8 @@ clean_up_plot_directory(){
    mkdir -p /root/.config/plot_manager
    if test -f "/root/.config/plot_manager/plot_manager.yaml"; then
      echo -e  "/root/.config/plot_manager/plot_manager.yaml already exists....\n"
-     echo -e  "Making a backup...."
-     cp /root/.config/plot_manager/plot_manager.yaml /root/.config/plot_manager/plot_manager.yaml.backup
-     echo -e "Please make sure to check your settings!!!"
+     echo -e "Launching our ${blue}Configuration File Updater${nc} to see if updates are needed.......\n"
+     $current_directory/config_file_updater.py
     else
      cp $current_directory/plot_manager.skel.yaml /root/.config/plot_manager/plot_manager.yaml
      cp $current_directory/plot_manager.skel.yaml /root/.config/plot_manager/INSTRUCTIONS.yaml
@@ -214,7 +213,7 @@ nuke_snap (){
 update_software_and_system(){
   echo -e "\n\n${green}Updating System Software and Installing Required Packages.........${nc}\n"
   apt update && apt upgrade -y  # Let's do the basic update of our software before we do anything else
-  apt install locate vim wget smartmontools tree unzip net-tools tmux glances python3-pip pv nmap sysstat postfix mailutils -y
+  apt install locate vim wget smartmontools tree unzip net-tools tmux python3-pip pv nmap ncat sysstat postfix mailutils -y
   if [ $(dpkg-query -W -f='${Status}' openssh-server 2>/dev/null | grep -c "ok installed") -eq 0 ]; then
       apt install openssh-server -y
       systemctl enable openssh
@@ -401,6 +400,32 @@ set_cpu_performance(){
         fi
 }
 
+
+create_check_network_io_script(){
+  echo -e "\nCreating ${green}$current_directory/check_network_io.sh${nc}....."
+  cat <<EOF >>$current_directory/check_network_io.sh
+#! /bin/bash
+/usr/bin/sar -n DEV 1 3 | egrep \$1 > $current_directory/network_stats.io
+EOF
+}
+
+create_send_plot_script(){
+  cat <<EOF >>$current_directory/send_plot.sh
+#!/bin/bash
+
+# Script that we call to send our plots to the selected NAS. Created by the install script
+# in order to grab the current working directory. If you have installed you script in a location
+# other than $current_directory on you NAS, you will need to update this script to match that
+# directory location!
+
+ssh root@\$3 "nohup $current_directory/receive_plot.sh \$2 > foo.out 2> foo.err < /dev/null &"
+sudo /usr/bin/pv "\$1" | sudo /usr/bin/ncat \$3
+exit
+EOF
+}
+
+
+
 ## Share some final notes...
 final_notes(){
   get_current_directory
@@ -441,6 +466,7 @@ start_install_nas(){
     nuke_snap
     update_software_and_system
     create_example_directory_structure
+    create_check_network_io_script
     improve_network_performance
     set_cpu_performance
     update_crontab_nas
@@ -455,6 +481,8 @@ start_install_plot(){
     get_current_directory_nas_plot
     nuke_snap
     update_software_and_system
+    create_check_network_io_script
+    create_send_plot_script
     improve_network_performance
     set_cpu_performance
     update_crontab_plot

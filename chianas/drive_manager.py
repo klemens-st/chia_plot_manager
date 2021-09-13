@@ -1,11 +1,43 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 # -*- coding: utf-8 -*-
 
 __author__ = 'Richard J. Sears'
-VERSION = "0.92 (2021-06-07)"
+VERSION = "0.96 (2021-09-05)"
 
 """
+NOTE NOTE NOTE NOTE NOTE NOTE NOTE
+This script is designed to run with a particular directory structure:
+
+/mnt
+     ├── enclosure0
+     │   ├── front
+     │   │   ├── column0
+     │   │   │   ├── drive2
+     │   │   │   ├── drive3
+     │   │   │   ├── drive4
+     │   │   │   └── drive5
+     ├── enclosure1
+     │   ├── rear
+     │   │   ├── column0
+     │   │   │   ├── drive6
+     │   │   │   ├── drive7
+
+
+Because of this, if you have a different directory structure there are
+changes that you will to make for this to work for you. For example
+if you have mountpoints that start with `/mnt/server0` instead of
+`/mnt/enclosure0`, you will need to look for each instance of
+`/mnt/enclosure` in this script and replace it with `/mnt/server0`
+in order for things to work properly.
+
+In addition, you would also need to modify get_path_info_by_mountpoint()
+so that it returns the correct values as well. Eventually I will attempt
+to figure this out on the fly, but for right now this needs to be done
+to get the script working for you.
+
+
+
 Simple python script that helps to move my chia plots from my plotter to
 my nas. I wanted to use netcat as it was much faster on my 10GBe link than
 rsync and the servers are secure so I wrote this script to manage that
@@ -14,7 +46,31 @@ other things like notifications and stuff.
 
 
  Updates
- 
+   v0.94 2021-08-08
+   - Added ability to search for any UUID across any harvester and it will return
+     the harvester the UUID is located on as well as the mountpoint where it is
+     assigned. Eventually will be used for automated moving of drives between
+     systems.
+
+   - Added ability to support pool plots. Now is you tell the system you are doing
+     pool plots, it will prepend the name of every  plot with "portable." so that
+     we can manage those plots.
+
+   - Added ability both locally (if your harvester is a local plotter) or remotely
+     (vi a remote plotter) to replace your old style plots on a one-by-one basis
+     with new portable plots. Minimized number of plots that have to be deleted to
+     convert to new plots. Has ability to fill empty drives first with new plots
+     before deleting old plots based on a specific high water mark. When using your
+     harvester as both a local plotter and harvester, will move locla plots to a
+     different drive than where inbound external plots are being saved to help with
+     drive bus contention.
+
+   - Updated the harvester export functions to support old plot replacement and
+     reporting.
+
+   - Updated local plot reports to report on plot replacement stats (old plots vs new
+     plots during the plot replacement process. Still need to work on farm reports.
+
    V0.92 2021-05-31
    - Converted to a central YAML config file
  
@@ -93,7 +149,7 @@ import sys
 import subprocess
 import shutil
 import psutil
-from pySMART import Device  # CAUTION - DO NOT use PyPI version, use https://github.com/truenas/py-SMART
+from pySMART import Device, DeviceList  # CAUTION - DO NOT use PyPI version, use https://github.com/truenas/py-SMART
 from psutil._common import bytes2human
 import logging
 from system_logging import setup_logging
@@ -109,8 +165,10 @@ import mmap
 import json
 import paramiko
 import pathlib
-from drivemanager_classes import DriveManager, config_file, config_file_update
+from drivemanager_classes import DriveManager, PlotManager, config_file
 chianas = DriveManager.read_configs()
+chiaplots = PlotManager.get_plot_info()
+
 script_path = pathlib.Path(__file__).parent.resolve()
 
 
@@ -127,7 +185,10 @@ nc='\033[0m'
 plot_size_k = 108995911228
 plot_size_g = 101.3623551
 receive_script = script_path.joinpath('receive_plot.sh')
-
+replace_plots_receive_script = script_path.joinpath('replace_plots_receive_plot.sh')
+remote_transfer_active_file = script_path.joinpath('remote_transfer_is_active')
+network_check = script_path.joinpath('check_network_io.sh')
+network_check_output = script_path.joinpath('network_stats.io')
 
 # Date and Time Stuff
 current_military_time = datetime.now().strftime('%Y%m%d%H%M%S')
@@ -167,6 +228,9 @@ Finally if you want to run remote harvester reports, set to True in the YAML
 config file.
 """
 local_export_file = script_path.joinpath(f'export/{chianas.hostname}_export.json')
+uuid_export_file = script_path.joinpath(f'export/{chianas.hostname}_uuid_export.json')
+global_uuid_export_file = script_path.joinpath(f'export/{chianas.hostname}_global_uuid_export.json')
+
 
 
 def remote_harvester_report():
@@ -191,7 +255,8 @@ def remote_harvester_report():
                     servers.append(harvester)
             totals = {'total_plots': 0, 'total_plots_farming': 0, 'total_tib_farming': 0, 'total_plot_drives': 0,
                       'total_plots_until_full': 0, 'max_plots_when_full': 0, 'plots_last_day': 0, 'avg_plots_per_hour': 0,
-                      'avg_plotting_speed': 0, 'approx_days_to_fill_drives': 0}
+                      'avg_plotting_speed': 0, 'approx_days_to_fill_drives': 0, 'replace_non_pool_plots': 0,
+                      'total_number_of_old_plots': 0, 'total_number_of_portable_plots': 0}
             for e in servers:
                 totals["total_plots"] += e["total_plots"]
                 totals["total_plots_farming"] += e["total_plots_farming"]
@@ -203,8 +268,48 @@ def remote_harvester_report():
                 totals["avg_plots_per_hour"] += e["avg_plots_per_hour"]
                 totals["avg_plotting_speed"] += e["avg_plotting_speed"]
                 totals["approx_days_to_fill_drives"] += e["approx_days_to_fill_drives"]
+                totals["replace_non_pool_plots"] += e["replace_non_pool_plots"]
+                totals["total_number_of_old_plots"] += e["total_number_of_old_plots"]
+                totals["total_number_of_portable_plots"] += e["total_number_of_portable_plots"]
             return totals, servers, remote_harvesters
 
+
+def uuid_search(uuid):
+    """
+    Searched all available remote harvesters for a specific UUID and returns
+    the server and mountpoint if found. Because of the code, remote harvester
+    reports must be configured and working for this to work.
+    """
+    if not chianas.remote_harvester_reports:
+        log.debug('Remote Harvester Reports are NOT Configured')
+    else:
+        remote_harvesters = check_remote_harvesters()
+        if chianas.hostname in remote_harvesters:
+            print(f'\n{red}CAUTION{nc}: Your local harvester {yellow}{chianas.hostname}{nc} is listed as one of your remote harvesters!')
+            print(f'{red}CAUTION{nc}: Unable to Run UUID Search. Please Correct!\n')
+            exit()
+        else:
+            servers = []
+            master_uuid = dict()
+            with open(uuid_export_file, 'r') as local_host:
+                harvester = json.loads(local_host.read())
+                servers.append(harvester)
+                master_uuid.update(harvester)
+            for harvester in remote_harvesters:
+                remote_export_file = (script_path.joinpath(f'export/{harvester}_uuid_export.json').as_posix())
+                get_remote_exports(harvester, remote_export_file)
+                with open(remote_export_file, 'r') as remote_host:
+                    harvester = json.loads(remote_host.read())
+                    servers.append(harvester)
+                    master_uuid.update(harvester)
+            with open(global_uuid_export_file, 'w') as global_export_file:
+                global_export_file.write(json.dumps(master_uuid))
+            with open(global_uuid_export_file, "r") as f:
+                uuid_search = json.loads(f.read())
+            try:
+                return uuid_search[uuid]
+            except KeyError:
+                return False
 
 def check_remote_harvesters():
     """
@@ -243,46 +348,6 @@ def get_remote_exports(host, remote_export_file):
     finally:
         ssh.close()
 
-
-def farm_wide_space_report():
-    """
-    This prints out our Farm Wide Report
-    """
-    if chianas.remote_harvester_reports:
-        remote_harvester_reports = (remote_harvester_report())
-        totals = remote_harvester_reports[0]
-        days_until_full = (totals.get("total_plots_until_full") / totals.get("plots_last_day"))
-        harvesters = [chianas.hostname, *remote_harvester_reports[2]]
-        print('')
-        print(f'{blue}############################################################{nc}')
-        print(f'{blue}################### {green}Farm Wide Plot Report{blue} ##################{nc}' )
-        print(f'{blue}############################################################{nc}')
-        print(f'Harvesters: {yellow}{harvesters}{nc}')
-        print (f'Total Number of Plots on {green}Farm{nc}:                          {yellow}{totals.get("total_plots")}{nc}')
-        print (f'Total Number of Plots {green}Chia{nc} is Farming:                  {yellow}{totals.get("total_plots_farming")}{nc}')
-        print (f'Total Amount of Drive Space (TiB) {green}Chia{nc} is Farming:       {yellow}{totals.get("total_tib_farming")}{nc}')
-        print (f'Total Number of Systemwide Plots Drives:                 {yellow}{totals.get("total_plot_drives")}{nc}')
-        print (f'Total Number of k32 Plots until full:                   {yellow}{totals.get("total_plots_until_full")}{nc}')
-        print (f'Maximum # of plots when full:                          {yellow}{totals.get("max_plots_when_full")}{nc}')
-        print (f'Plots completed in the last 24 Hours:                    {yellow}{totals.get("plots_last_day")}{nc}')
-        print (f'Average Plots per Hour:                                  {yellow}{round(totals.get("avg_plots_per_hour"))}{nc}')
-        print (f'Average Plotting Speed Last 24 Hours (TiB/Day):           {yellow}{round(totals.get("avg_plotting_speed"))}{nc}')
-        print(f'Appx Number of Days to fill all current plot drives:     {yellow} {round(days_until_full)}{nc}')
-        print(f'{blue}############################################################{nc}')
-        individual_harvester_report(remote_harvester_reports[1], remote_harvester_reports[2])
-        print()
-    else:
-        print(f'\n{red}ERROR{nc}: {yellow}Farm Wide Reports Have Not Been Configured. Please Configure and Try Again!{nc}\n')
-
-def individual_harvester_report(servers, remote_harvesters):
-    for server in servers:
-        print(f'{blue}################ {green}{server["server"]} Harvester Report{blue} ################{nc}')
-        print(f'{blue}############################################################{nc}')
-        print(f'Total number of plots on {green}{server["server"]}{nc}:                    {yellow}{server["total_plots"]}{nc}')
-        print(f'Plots completed in the last 24 hours:                  {yellow}{server["plots_last_day"]}{nc}')
-        print(f'Average Plotting Speed Last 24 Hours (Tib/Day):        {yellow}{server["avg_plotting_speed"]}{nc}')
-        print(f'Appx # of Days to fill all drives on this harvester:   {yellow}{server["approx_days_to_fill_drives"]}{nc}')
-        print(f'{blue}############################################################{nc}')
 
 
 # Define our help message
@@ -326,6 +391,16 @@ program_descripton = f'''
                                 from the last time is was run until now, hence why you should
                                 only run this once per 24 hours.{nc}
     
+    {green}-rp {nc}or{green} --replace_plot{blue}       This is {yellow}GENERALLY{blue} run remotely by your plotter when it detects
+                                that you are configured for plot replacement, ie - you have a
+                                lot of old plots and you are replacing them with new portable
+                                style plots. Use {red}CAUTION{blue} running it manually! It might {nc}DELETE{blue}
+                                an old plot every time it is run but should only do so if
+                                there is no space available on the selected drive.{nc}
+
+    {green}-uuid {nc}or{green} --check_uuid{blue}       This checks all remote harvesters to see if the requested UUID is
+                                present and mounted. Returns the server and mountpoint if found.{nc}
+
     {green}-off {nc}or{green} --offline_hdd{blue}       This takes a drive as it's input (for example {yellow} drive6{blue}) and
                                 "{red}offlines{blue}" it so that no more plots will get written to it. 
                                 You must {green}--on{blue} or {green}--online_hdd{blue} the drive for it to be used
@@ -349,6 +424,9 @@ def init_argparser():
     parser.add_argument('-pr', '--plot_report', action='store_true', help='Return the total # of plots on the system and total you can add and exit')
     parser.add_argument('-fr', '--farm_report', action='store_true',help='Return the total # of plots on your entire farm and total you can add and exit')
     parser.add_argument('-ud', '--update_daily', action='store_true', help=f'Updates 24 hour plot count. {red}USE WITH CAUTION, USE WITH CRONTAB{nc}')
+    parser.add_argument('-rp', '--replace_plot', action='store_true',
+                        help=f'Remove a single old Plot. {red}USE WITH CAUTION, READ DOCS FIRST{nc}. Generally called remotely by Plotter!')
+    parser.add_argument('-uuid', '--check_uuid', action='store', help=f'Check to see is a specific {green}UUID{nc} is mounted on any harvester')
     parser.add_argument('-off', '--offline_hdd', action='store', help=f'Offline a specific drive. Use drive number: {green}drive6{nc}')
     if chianas.offlined_drives != []:
         parser.add_argument('-on', '--online_hdd', action='store', help=f'Online a specific drive.' , choices=chianas.offlined_drives)
@@ -434,6 +512,16 @@ def get_mountpoint_by_drive_number(drive):
         if p.device.startswith('/dev/sd') and p.mountpoint.startswith('/mnt/enclosure') and p.mountpoint.endswith(drive):
             return [(p.mountpoint)]
 
+def get_mountpoint_by_drive_number_enclosure(enclosure, drive):
+    """
+    This accepts an enclosure (enclosure0) and  drive number (drive0) and returns the device assignment: /dev/sda1 and mountpoint:
+    /mnt/enclosure0/front/column0/drive0
+    """
+    partitions = psutil.disk_partitions(all=False)
+    for p in partitions:
+        if p.device.startswith('/dev/sd') and p.mountpoint.startswith('/mnt/' + enclosure) and p.mountpoint.endswith(drive):
+            return [(p.mountpoint)]
+
 
 def get_device_info_by_drive_number(drive):
     """
@@ -442,6 +530,16 @@ def get_device_info_by_drive_number(drive):
     partitions = psutil.disk_partitions(all=False)
     for p in partitions:
         if p.device.startswith('/dev/sd') and p.mountpoint.startswith('/mnt/enclosure') and p.mountpoint.endswith(drive):
+            return [(p.mountpoint, p.device)]
+
+
+def get_device_info_by_drive_number_enclosure(enclosure, drive):
+    """
+    This accepts an enclosure (enclosure2) and drive number (drive0) and returns the device assignment: /dev/sda1 and mountpoint
+    """
+    partitions = psutil.disk_partitions(all=False)
+    for p in partitions:
+        if p.device.startswith('/dev/sd') and p.mountpoint.startswith('/mnt/'+ enclosure) and p.mountpoint.endswith(drive):
             return [(p.mountpoint, p.device)]
 
 
@@ -481,8 +579,17 @@ def get_list_of_plot_drives():
 def get_path_info_by_mountpoint(mountpoint, info):
     """
     This accepts a mountpoint ('/mnt/enclosure0/rear/column2/drive32') and returns the enclosure:
-    enclosure1
-    ks: This is defined but not used.
+    enclosure1. This will need to be changed based on your current directory configuration. For
+    example if your mount point looked like this: "/server01/top/row1/drive4" this would look like:
+
+    if info == 'server':
+        return (mountpoint.split("/")[2])
+    elif info == 'topbottom':
+        return (mountpoint.split("/")[3])
+    elif info == 'row':
+        return (mountpoint.split("/")[4])
+    else:
+        return (f'/{mountpoint.split("/")[1]}')
     """
     if info == 'enclosure':
         return (mountpoint.split("/")[2])
@@ -560,6 +667,7 @@ def get_plot_drive_to_use():
         return (natsorted(available_drives)[0])
     except IndexError:
         log.debug("ERROR: No Drives Found, Please add drives, run auto_drive.py and try again!")
+        notify('OUT OF DRIVE SPACE!', 'You have run out of drive space on your Harvester and we can no longer accept any new plots!')
         exit()
 
 
@@ -579,10 +687,20 @@ def get_internal_plot_drive_to_use():
                 drive = get_drive_by_mountpoint(part.mountpoint)
                 available_drives.append((part.mountpoint, part.device, drive))
         return (natsorted(available_drives)[1])
-    except IndexError:
-        log.debug("ERROR: No Additional Internal Drives Found, Please add drives, run auto_drive.py and try again!")
-        exit()
-
+    except IndexError: # We will get an IndexError when we run out of drive space
+        # If we have no more drive space available on a drive not already being use to store local plot AND we are using pools and have elected to
+        # replace non-pool plots, fall back to returning pool plot internal replacement drive:
+        if chianas.pools and chianas.replace_non_pool_plots: # Sanity check, must have pools and replace_non__pool_plots set to true in config file.
+            log.debug('CAUTION: No additional internal drives are available for use! Since you have replace_non_pools_plots set,')
+            log.debug('we are going to return the next available local plot drives with old plots to replace.')
+            return chiaplots.local_plot_drive
+        else:
+            # If we have no more drives left, fall back to the only drive left on the system with space available
+            log.debug('CAUTION: No additional internal drives are available for use! Defaulting to using the next available drive with space available.')
+            log.debug('This can cause contention on the drive bus and slow down all transfers, internal and external. It is recommended that you resolve')
+            log.debug('this issue is you are able.')
+            notify('Drive Overlap!', 'Internal and External plotting drives now overlap! Suggest fixing to prevent drive bus contention and slow transfers. If you have selected plot replacement, we will attempt to convert to replacement now.')
+            return get_plot_drive_to_use()
 
 
 def get_sorted_drive_list():
@@ -627,7 +745,7 @@ def online_offline_drive(drive, onoffline):
     Function to online and offline a drive for maintenance, etc. A drive that has been
     'offlined' will not have any plots written to it.
     """
-    log.debug(f'online_offline_drive() called with [{drive}] , [{onoffline}]')
+    log.debug(f'online_offline_drive() Started with [{drive}] , [{onoffline}]')
     if get_device_info_by_drive_number(drive) == None:
         print()
         print(f'{red}WARNING{nc}: {blue}{drive}{nc} does not exist or is not mounted on this system!')
@@ -665,6 +783,79 @@ def online_offline_drive(drive, onoffline):
                 return False
 
 
+def replace_plot():
+    log.debug("replace_plot() Started")
+    if not chianas.replace_non_pool_plots: #Let's just verify that we really want to replace our old plots...
+        log.debug('Non-Pool Plot Replacement set to False, moving on......')
+        update_receive_plot()
+    else:
+        if not chianas.fill_empty_drives_first:
+            if chiaplots.plots_to_replace:
+                if check_space_available(chiaplots.plot_drive): # Check to see if we have any space available on the drive before we delete a plot
+                    log.debug(f'We have {chiaplots.number_of_old_plots} plots to replace.')
+                    log.debug(f'The next inbound plot will be saved here: {chiaplots.plot_drive}')
+                    log.debug(f'We currently have {chiaplots.number_of_portable_plots} portable plots on the system.')
+                    log.debug(f'We have room on [{chiaplots.plot_drive}] for another plot, no need to delete plot..... ')
+                    update_receive_plot()
+                else:
+                    log.debug(f'We have {chiaplots.number_of_old_plots} plots to replace.')
+                    log.debug(f'We will remove this plot first: {chiaplots.next_plot_to_replace}')
+                    log.debug(f'The next inbound plot will be saved here: {chiaplots.plot_drive}')
+                    log.debug(f'We currently have {chiaplots.number_of_portable_plots} portable plots on the system.')
+                    os.remove(chiaplots.next_plot_to_replace)
+                    if not os.path.isfile(chiaplots.next_plot_to_replace):
+                        log.debug('Old Plot has been removed, making room for new Portable Plot! Continuing..... ')
+                        update_receive_plot()
+                    else:
+                        log.debug('ERROR: Plot Still Exists!! EXITING')
+                        raise Exception
+            else:
+                print('No further old plots to replace!!')
+                update_receive_plot()
+        else:
+            if (get_all_available_system_space("free")[1]) < chianas.empty_drives_low_water_mark: # Do we have an empty drive space left?
+                if chiaplots.plots_to_replace:
+                    if check_space_available(chiaplots.plot_drive):
+                        log.debug(f'We have {chiaplots.number_of_old_plots} plots to replace.')
+                        log.debug(f'The next inbound plot will be saved here: {chiaplots.plot_drive}')
+                        log.debug(f'We currently have {chiaplots.number_of_portable_plots} portable plots on the system.')
+                        log.debug(f'We have room on [{chiaplots.plot_drive}] for another plot, no need to delete plot..... ')
+                        update_receive_plot()
+                    else:
+                        log.debug(f'We have {chiaplots.number_of_old_plots} plots to replace.')
+                        log.debug(f'We will remove this plot first: {chiaplots.next_plot_to_replace}')
+                        log.debug(f'The next inbound plot will be saved here: {chiaplots.plot_drive}')
+                        log.debug(f'We currently have {chiaplots.number_of_portable_plots} portable plots on the system.')
+                        os.remove(chiaplots.next_plot_to_replace)
+                        if not os.path.isfile(chiaplots.next_plot_to_replace):
+                            print('Old Plot has been removed, making room for new Portable Plot! Continuing..... ')
+                            update_receive_plot()
+                        else:
+                            log.debug('ERROR: Plot Still Exists!! EXITING')
+                            raise Exception
+                else:
+                    log.debug('No further old plots to replace!')
+                    update_receive_plot()
+            else:
+                log.debug('replace_plot() called, but fill_empty_drives_first is set and we have drive space available.') # Call build script and point to current plot drive
+                log.debug(f'Low Water Mark: {chianas.empty_drives_low_water_mark} and we have {get_all_available_system_space("free")[1]} available')
+                log.debug('Defaulting to SAVING plot instead of REPLACING plot until we fall below our Low Water Mark.')
+                update_receive_plot()
+
+
+def check_space_available(drive):
+    """
+    Determine if we have space on our local move drive and if not, flag it.
+    """
+    log.debug(f'check_space_available() called with: [{drive}]')
+    space_available = get_drive_info("space_free_plots_by_mountpoint", drive)
+    if space_available > 0:
+        log.debug(f'We can store an additional [{space_available}] plots on [{drive}]')
+        return True
+    else:
+        log.debug(f'There is no free space available on [{drive}] for any additional plots.')
+        return False
+
 
 def update_receive_plot():
     """
@@ -677,68 +868,204 @@ def update_receive_plot():
     here. See TODO: Update to use netcat native to python.
     """
     log.debug("update_receive_plot() Started")
-    if not os.path.isfile(receive_script):
-        log.debug(f'{receive_script} not found. Build it now...')
-        build_receive_plot()
-    else:
-        total_serverwide_plots = get_all_available_system_space('used')[1]
-        log.debug(f'Total Serverwide Plots: {total_serverwide_plots}')
-        # First determine if there is a remote file transfer in process. If there is, pass until it is done:
-        if os.path.isfile(script_path.joinpath('remote_transfer_is_active')):
-            log.debug('Remote Transfer in Progress, will try again soon!')
-            quit()
+    remote_transfer_active = check_for_active_remote_transfer()
+    if not chianas.replace_non_pool_plots: # If we are not replacing old plots with new portable plots, run the following code
+        log.debug('Replace Plots has NOT been set in config, will call build script for normal operation.')
+        drive = get_plot_drive_to_use()[0]
+        if not os.path.isfile(receive_script):
+            log.debug(f'{receive_script} not found. Building it now...')
+            build_receive_plot('normal', drive)
         else:
-            if chianas.current_plotting_drive == get_plot_drive_to_use()[0]:
-                log.debug(f'Currently Configured Plot Drive: {chianas.current_plotting_drive}')
-                log.debug(f'System Selected Plot Drive:      {get_plot_drive_to_use()[0]}')
-                log.debug('Configured and Selected Drives Match!')
-                log.debug(f'No changes necessary to {receive_script}')
-                log.debug(
-                    f'Plots left available on configured plotting drive: {get_drive_info("space_free_plots_by_mountpoint", chianas.current_plotting_drive)}')
+            if remote_transfer_active:
+                log.debug('Remote Transfer in Progress, will try again soon!')
+                quit() # TODO Think about what we really want to do here. If we are running a remote transfer, can we still do other things?
             else:
-                send_new_plot_disk_email()  # This is the full Plot drive report. This is in addition to the generic email sent by the
-                                            # notify() function.
-                notify('Plot Drive Updated', f'Plot Drive Updated: Was: {chianas.current_plotting_drive},  Now: {get_plot_drive_to_use()[0]}')
-                build_receive_plot()
+                if chianas.current_plotting_drive == drive:
+                    log.debug(f'Currently Configured Plot Drive: {chianas.current_plotting_drive}')
+                    log.debug(f'System Selected Plot Drive:      {drive}')
+                    log.debug('Configured and Selected Drives Match!')
+                    log.debug(f'No changes necessary to {receive_script}')
+                    log.debug(f'Plots left available on configured plotting drive: {get_drive_info("space_free_plots_by_mountpoint", chianas.current_plotting_drive)}')
+                else:
+                    send_new_plot_disk_email()  # This is the full Plot drive report. This is in addition to the generic email sent by the
+                                                # notify() function.
+                    notify('Plot Drive Updated', f'Plot Drive Updated: Was: {chianas.current_plotting_drive},  Now: {drive}')
+                    build_receive_plot('normal', drive)
+    else:
+        log.debug('Replace Plots Set, will call build script for plot replacement!')
+        log.debug('Checking to see if we need to fill empty drives first......')
+        if chianas.fill_empty_drives_first:
+            log.debug('fill_empty_drives_first flag is set. Checking for empty drive space.....')
+            if (get_all_available_system_space("free")[1]) > chianas.empty_drives_low_water_mark:
+                log.debug('Found Empty Drive Space!')
+                log.debug(f'Low Water Mark: {chianas.empty_drives_low_water_mark} and we have {get_all_available_system_space("free")[1]} available')
+                drive = get_plot_drive_to_use()[0]
+                if not os.path.isfile(receive_script):
+                    log.debug(f'{receive_script} not found. Building it now...')
+                    build_receive_plot('normal', drive)
+                else:
+                    if remote_transfer_active:
+                        log.debug('Remote Transfer in Progress, will try again soon!')
+                        quit()  # TODO Think about what we really want to do here. If we are running a remote transfer, can we still do other things?
+                    else:
+                        if chianas.current_plotting_drive == drive:
+                            log.debug(f'Currently Configured Plot Drive: {chianas.current_plotting_drive}')
+                            log.debug(f'System Selected Plot Drive:      {drive}')
+                            log.debug('Configured and Selected Drives Match!')
+                            log.debug(f'No changes necessary to {receive_script}')
+                            log.debug(f'Plots left available on configured plotting drive: {get_drive_info("space_free_plots_by_mountpoint", chianas.current_plotting_drive)}')
+                        else:
+                            send_new_plot_disk_email()  # This is the full Plot drive report. This is in addition to the generic email sent by the notify() function.
+                            notify('Plot Drive Updated', f'Plot Drive Updated: Was: {chianas.current_plotting_drive},  Now: {drive}')
+                            build_receive_plot('normal', drive)
+            else:
+                log.debug('fill_empty_drives_first flag is set, but we have no available free drive space....Defaulting to REPLACE PLOTS!')
+                log.debug(f'Low Water Mark: {chianas.empty_drives_low_water_mark} and we have {get_all_available_system_space("free")[1]} available')
+                log.debug('Checking to see if we have any old plots to replace.....')
+                if chiaplots.plots_to_replace:
+                    log.debug(f'We found [{chiaplots.number_of_old_plots}] to replace. Continuing....')
+                    drive = chiaplots.plot_drive
+                    if not os.path.isfile(receive_script):
+                        log.debug(f'{receive_script} not found. Building it now...')
+                        build_receive_plot('portable', drive)
+                    else:
+                        if remote_transfer_active:
+                            log.debug('Remote Transfer in Progress, will try again soon!')
+                            quit()  # TODO Think about what we really want to do here. If we are running a remote transfer, can we still do other things?
+                        else:
+                            if chianas.current_plot_replacement_drive == drive:
+                                log.debug(f'Currently Configured Replacement Drive: {chianas.current_plot_replacement_drive}')
+                                log.debug(f'System Selected Replacement Drive:      {drive}')
+                                log.debug('Configured and Selected Drives Match!')
+                                log.debug(f'No changes necessary to {receive_script}')
+                            else:
+                                notify('Plot Replacement Drive Updated', f'Plot Drive Updated: Was: {chianas.current_plot_replacement_drive},  Now: {drive}')
+                                build_receive_plot('portable', drive)
+                else:
+                    log.debug(f'ERROR: Replace Plots Configured, but no old plots exist!')
+                    quit()
+        else:
+            log.debug('fill_empty_drives_first flag NOT set, continuing....')
+            log.debug('Checking to see if we have any old plots to replace.....')
+            if chiaplots.plots_to_replace:
+                log.debug(f'We found [{chiaplots.number_of_old_plots}] to replace. Continuing....')
+                drive = chiaplots.plot_drive
+                if not os.path.isfile(receive_script):
+                    log.debug(f'{receive_script} not found. Building it now...')
+                    build_receive_plot('portable', drive)
+                else:
+                    if remote_transfer_active:
+                        log.debug('Remote Transfer in Progress, will try again soon!')
+                        quit()  # TODO Think about what we really want to do here. If we are running a remote transfer, can we still do other things?
+                    else:
+                        if chianas.current_plot_replacement_drive == drive:
+                            log.debug(f'Currently Configured Replacement Drive: {chianas.current_plot_replacement_drive}')
+                            log.debug(f'System Selected Replacement Drive:      {drive}')
+                            log.debug('Configured and Selected Drives Match!')
+                            log.debug(f'No changes necessary to {receive_script}')
+                        else:
+                            notify('Plot Replacement Drive Updated', f'Plot Drive Updated: Was: {chianas.current_plot_replacement_drive},  Now: {drive}')
+                            build_receive_plot('portable', drive)
+            else:
+                log.debug(f'ERROR: Replace Plots Configured, but no old plots exist! Defaulting to filling our empty drives...')
+                if (get_all_available_system_space("free")[1]) > chianas.empty_drives_low_water_mark:
+                    log.debug('Found Empty Drive Space!')
+                    log.debug(f'Low Water Mark: {chianas.empty_drives_low_water_mark} and we have {get_all_available_system_space("free")[1]} available')
+                    drive = get_plot_drive_to_use()[0]
+                    if not os.path.isfile(receive_script):
+                        log.debug(f'{receive_script} not found. Building it now...')
+                        build_receive_plot('normal', drive)
+                    else:
+                        if remote_transfer_active:
+                            log.debug('Remote Transfer in Progress, will try again soon!')
+                            quit()  # TODO Think about what we really want to do here. If we are running a remote transfer, can we still do other things?
+                        else:
+                            if chianas.current_plotting_drive == drive:
+                                log.debug(f'Currently Configured Plot Drive: {chianas.current_plotting_drive}')
+                                log.debug(f'System Selected Plot Drive:      {drive}')
+                                log.debug('Configured and Selected Drives Match!')
+                                log.debug(f'No changes necessary to {receive_script}')
+                                log.debug(
+                                    f'Plots left available on configured plotting drive: {get_drive_info("space_free_plots_by_mountpoint", chianas.current_plotting_drive)}')
+                            else:
+                                send_new_plot_disk_email()  # This is the full Plot drive report. This is in addition to the generic email sent by the notify() function.
+                                notify('Plot Drive Updated',
+                                       f'Plot Drive Updated: Was: {chianas.current_plotting_drive},  Now: {drive}')
+                                build_receive_plot('normal', drive)
+                else:
+                    log.debug('We have a problem. There are no old plots to replace and we have run out of empty drive space, not sure what to do now but phone home.....')
+                    notify('No Old Plots & No Drive Space Available', 'We have a problem. There are no old plots to replace and we have run out of empty drive space, I need your help!')
+                quit()
 
-def build_receive_plot():
+def build_receive_plot(type, drive):
     """
     Function to build or rebuild our receive_plot.sh script.
     :return:
     """
     f = open(receive_script, 'w+')
     f.write('#! /bin/bash \n')
-    f.write(f'nc -l -q5 -p 4040 > "{get_plot_drive_to_use()[0]}/$1" < /dev/null')
+    f.write(f'ncat -l > "{drive}/$1" < /dev/null')
     f.close()
     os.chmod(receive_script, 0o755)
-    chianas.update_current_plotting_drive(get_plot_drive_to_use()[0])
-    log.info(f'Updated {receive_script} and system config file with new plot drive.')
-    log.info(f'Was: {chianas.current_plotting_drive},  Now: {get_plot_drive_to_use()[0]}')
-    log_drive_report()
+    chianas.update_current_plot_replacement_drive(drive)
+    chianas.update_current_plotting_drive(drive)
+    if type == 'portable':
+        log.info(f'Updated {receive_script} and system config file with new plot replacement drive.')
+        log.info(f'Was: {chianas.current_plot_replacement_drive},  Now: {drive}')
+    else:
+        log.info(f'Updated {receive_script} and system config file with new plot drive.')
+        log.info(f'Was: {chianas.current_plotting_drive},  Now: {drive}')
 
 
-def update_move_local_plot():
+def check_for_active_remote_transfer():
     """
-    This function just keeps our local plot moves off the same drive as our remote plot moves so
-    we don't saturate a single drive with multiple inbound plots.
+    Function to check and verify if we have a remote transfer active to prevent
+    overloading drives during local and remote copies of plots.
     """
-
-    log.debug("update_move_local_plot() Started")
-    try:
-        if chianas.current_internal_drive == get_internal_plot_drive_to_use()[0]:
-            log.debug(f'Currently Configured Internal Plot Drive: {chianas.current_internal_drive}')
-            log.debug(f'System Selected Internal Plot Drive:      {get_internal_plot_drive_to_use()[0]}')
-            log.debug('Configured and Selected Drives Match!')
-            log.debug(f'No changes necessary to Internal Plotting Drive')
-            log.debug(
-                f'Plots left available on configured Internal plotting drive: {get_drive_info("space_free_plots_by_mountpoint", chianas.current_internal_drive)}')
+    log.debug('check_for_active_remote_transfer() called')
+    if os.path.isfile(remote_transfer_active_file):
+        log.debug(f'A Remote Transfer appears to be in Progress, checking for network traffic on interface: {chianas.plot_receive_interface}.')
+        if check_network_activity():
+            log.debug('Network traffic has been detected, a Remote Transfer is in progress.')
+            return True
         else:
-            notify('Internal Plot Drive Updated', f'Internal Plot Drive Updated: Was: {chianas.current_internal_drive},  Now: {get_internal_plot_drive_to_use()[0]}')
-            chianas.update_current_internal_drive(get_internal_plot_drive_to_use()[0])
-            log.info(f'Updated Internal Plot Drive, Was: {chianas.current_internal_drive},  Now: {get_internal_plot_drive_to_use()[0]}')
-    except TypeError:
-        log.debug ('No Additional Drives found to be used as internal plot drives!')
-        log.debug('Please add additional drive manually or via auto_drive.py and try again!')
+            log.debug(f'Remote Transfer file present but there is no network traffic on interface: {chianas.plot_receive_interface}')
+            log.debug('Resetting Remote Transfer file now......')
+            os.remove(remote_transfer_active_file)
+            return False
+    else:
+        log.debug('Remote Transfer File does not exist, lets check for network traffic to verify....')
+        if check_network_activity():
+            log.debug('Network traffic has been detected, a Remote Transfer is in progress.')
+            return True
+        else:
+            log.debug('No Current Remote Transfers are taking place.')
+            return False
+
+def check_network_activity():
+    """
+    Here we are checking network activity on the network interface we are receiving plots on from our plotter. If there is
+    network activity, then we are most likely receiving a plot and don't want to make any changes.
+    """
+    log.debug('check_network_activity() called')
+    try:
+        subprocess.call([network_check, chianas.plot_receive_interface])
+    except subprocess.CalledProcessError as e:
+        log.warning(e.output)
+    with open(network_check_output, 'rb') as f:
+        f.seek(-2, os.SEEK_END)
+        while f.read(1) != b'\n':
+            f.seek(-2, os.SEEK_CUR)
+        last_line = f.readline().decode()
+        network_traffic_load = float((str.split(last_line)[9]))
+    if network_traffic_load >= chianas.plot_receive_interface_threshold:
+        log.debug(f'Network Activity detected on {chianas.plot_receive_interface}')
+        os.remove(network_check_output)
+        return True
+    else:
+        log.debug(f'No Network Activity detected on {chianas.plot_receive_interface}')
+        os.remove(network_check_output)
+        return False
 
 
 def send_new_plot_disk_email():
@@ -747,6 +1074,10 @@ def send_new_plot_disk_email():
     plot has been created.
     """
     usage = psutil.disk_usage(get_device_by_mountpoint(get_plot_drive_to_use()[0])[0][0])
+    try:
+        days_to_fill_drives = (int(get_all_available_system_space('free')[1] / chianas.current_total_plots_daily))
+    except ZeroDivisionError:
+        days_to_fill_drives = 0
     if chianas.new_plot_drive:
         for email_address in chianas.emails:
             send_template_email(template='new_plotting_drive.html',
@@ -769,7 +1100,7 @@ def send_new_plot_disk_email():
                                 total_number_of_drives=get_all_available_system_space('total')[0],
                                 total_k32_plots_until_full=get_all_available_system_space('free')[1],
                                 max_number_of_plots=get_all_available_system_space('total')[1],
-                                days_to_fill_drives=(int(get_all_available_system_space('free')[1] / chianas.current_total_plots_daily)))
+                                days_to_fill_drives=days_to_fill_drives)
     else:
         pass
 
@@ -838,29 +1169,140 @@ def space_report():
     """
     Function that creates the space report from the command line.
     """
+    replace_plots = chianas.replace_non_pool_plots
     plots_last_day = chianas.current_total_plots_daily
     if plots_last_day == 0:
         plots_last_day = 1
+    if replace_plots:
+        days_to_fill = round((int((get_all_available_system_space("free")[1]) + int(chiaplots.number_of_old_plots)) / plots_last_day) , 0)
+    else:
+        days_to_fill = int(get_all_available_system_space('free')[1] / plots_last_day)
+    try:
+        current_plot_drive = (get_device_by_mountpoint(chianas.current_plotting_drive)[0][1])
+    except Exception as e:
+        current_plot_drive = 'N/A'
+    try:
+        current_plot_drive_temp = Device((get_device_by_mountpoint(chianas.current_plotting_drive)[0][1])).temperature
+    except Exception as e:
+        current_plot_drive_temp = 'N/A'
+    try:
+        current_plot_drive_smart_assesment = Device((get_device_by_mountpoint(chianas.current_plotting_drive)[0][1])).assessment
+    except Exception as e:
+        current_plot_drive_smart_assesment = 'N/A'
     print('')
     print(f'{blue}############################################################{nc}')
     print(f'{blue}################### {green}{chianas.hostname} Plot Report{blue} ##################{nc}' )
-    print(f'{blue}############################################################{nc}')
+    #print(f'{blue}############################################################{nc}')
+    if replace_plots:
+        print(f'{blue}############################################################{nc}')
+        print(f'{blue}######### {yellow}*** {red}OLD PLOT REPLACEMENT IN PROGRESS{yellow} ***{blue} #########')
+        print(f'{blue}############################################################{nc}')
+    else:
+        print(f'{blue}############################################################{nc}')
     print (f'Total Number of Plots on {green}{chianas.hostname}{nc}:                     {yellow}{get_all_available_system_space("used")[1]}{nc}')
+    if replace_plots:
+        print(f'Total Number of {red}OLD{nc} Plots on {green}{chianas.hostname}{nc}:                 {yellow}{chiaplots.number_of_old_plots}{nc}')
+        print(f'Total Number of {red}PORTABLE{nc} Plots on {green}{chianas.hostname}{nc}:             {yellow}{chiaplots.number_of_portable_plots}{nc}')
     print (f'Total Number of Plots {green}Chia{nc} is Farming:                  {yellow}{check_plots()[0]}{nc}')
     print (f'Total Amount of Drive Space (TiB) {green}Chia{nc} is Farming:       {yellow}{check_plots()[1]}{nc}')
     print (f'Total Number of Systemwide Plots Drives:                  {yellow}{get_all_available_system_space("total")[0]}{nc}')
-    print (f'Total Number of k32 Plots until full:                   {yellow}{get_all_available_system_space("free")[1]}{nc}')
+    print (f'Total Number of k32 Plots until full:                    {yellow}{get_all_available_system_space("free")[1]}{nc}')
     print (f'Maximum # of plots when full:                           {yellow}{get_all_available_system_space("total")[1]}{nc}')
-    print (f"Plots completed in the last 24 Hours:                     {yellow}{plots_last_day}{nc}")
+    print (f"Plots completed in the last 24 Hours:                    {yellow}{plots_last_day}{nc}")
     print (f"Average Plots per Hours:                                 {yellow}{round(chianas.current_total_plots_daily / 24, 1)}{nc}")
-    print (f"Average Plotting Speed Last 24 Hours (TiB/Day):         {yellow}{round((chianas.current_total_plots_daily * int(plot_size_g) / 1000), 2)}{nc} ")
-    print (f"Appx Number of Days to fill all current plot drives:     {yellow} {int(get_all_available_system_space('free')[1] / plots_last_day)} {nc} ")
-    print (f"Current Plot Storage Drive:                        {yellow}{(get_device_by_mountpoint(chianas.current_plotting_drive)[0][1])}{nc}")
-    print (f"Temperature of Current Plot Drive:                      {yellow}{Device((get_device_by_mountpoint(chianas.current_plotting_drive)[0][1])).temperature}°C{nc}")
-    print (f"Latest Smart Drive Assessment of Plot Drive:            {yellow}{Device((get_device_by_mountpoint(chianas.current_plotting_drive)[0][1])).assessment}{nc}")
+    print (f"Average Plotting Speed Last 24 Hours (TiB/Day):        {yellow}{round((chianas.current_total_plots_daily * int(plot_size_g) / 1000), 2)}{nc} ")
+    if replace_plots:
+        print (f"Days to fill/replace all current drives/plots:         {yellow} {days_to_fill} {nc} ")
+    else:
+        print(f"Days to fill all current drives:                          {yellow} {days_to_fill} {nc} ")
+    print (f"Current Plot Storage Drive:                       {yellow}{current_plot_drive}{nc}")
+    print (f"Temperature of Current Plot Drive:                      {yellow}{current_plot_drive_temp}°C{nc}")
+    print (f"Latest Smart Drive Assessment of Plot Drive:            {yellow}{current_plot_drive_smart_assesment}{nc}")
     print(f'{blue}############################################################{nc}')
     print('')
     print('')
+
+def farm_wide_space_report():
+    """
+    This prints out our Farm Wide Report
+    """
+    if chianas.remote_harvester_reports:
+        remote_harvester_reports = (remote_harvester_report())
+        totals = remote_harvester_reports[0]
+        days_until_full = (totals.get("total_plots_until_full") / totals.get("plots_last_day"))
+        harvesters = [chianas.hostname, *remote_harvester_reports[2]]
+        print('')
+        print(f'{blue}############################################################{nc}')
+        print(f'{blue}################### {green}Farm Wide Plot Report{blue} ##################{nc}' )
+        print(f'{blue}############################################################{nc}')
+        #print(f'Harvesters: {yellow}{harvesters}{nc}')
+        print (f'Total Number of Plots on {green}Farm{nc}:                         {yellow}{totals.get("total_plots")}{nc}')
+        print (f'Total Number of Plots {green}Chia{nc} is Farming:                 {yellow}{totals.get("total_plots_farming")}{nc}')
+        print (f'Total Amount of Drive Space (TiB) {green}Chia{nc} is Farming:      {yellow}{totals.get("total_tib_farming")}{nc}')
+        print (f'Total Number of Systemwide Plots Drives:                 {yellow}{totals.get("total_plot_drives")}{nc}')
+        print (f'Total Number of k32 Plots until full:                  {yellow}{totals.get("total_plots_until_full")}{nc}')
+        print (f'Maximum # of plots when full:                          {yellow}{totals.get("max_plots_when_full")}{nc}')
+        print (f'Plots completed in the last 24 Hours:                    {yellow}{totals.get("plots_last_day")}{nc}')
+        print (f'Average Plots per Hour:                                    {yellow}{round(totals.get("avg_plots_per_hour"))}{nc}')
+        print (f'Average Plotting Speed Last 24 Hours (TiB/Day):           {yellow}{round(totals.get("avg_plotting_speed"))}{nc}')
+        print(f'Appx Number of Days to fill/replace plots/drives:        {yellow} {round(days_until_full)}{nc}')
+        print(f'{blue}############################################################{nc}')
+        individual_harvester_report(remote_harvester_reports[1], remote_harvester_reports[2])
+        print()
+    else:
+        print(f'\n{red}ERROR{nc}: {yellow}Farm Wide Reports Have Not Been Configured. Please Configure and Try Again!{nc}\n')
+
+def individual_harvester_report(servers, remote_harvesters):
+    for server in servers:
+        print(f'{blue}################ {green}{server["server"]} Harvester Report{blue} ################{nc}')
+        print(f'{blue}############################################################{nc}')
+        if server["replace_non_pool_plots"]:
+            print (f'Replace Non-Pool Plots:                               {green}Active{nc}')
+            print(f'Total Number of {red}OLD{nc} Plots on {green}{server["server"]}{nc}:                 {yellow}{server["total_number_of_old_plots"]}{nc}')
+            print(f'Total Number of {red}PORTABLE{nc} Plots on {green}{server["server"]}{nc}:             {yellow}{server["total_number_of_portable_plots"]}{nc}')
+            print(f'Total number of plots on {green}{server["server"]}{nc}:                     {yellow}{server["total_plots"]}{nc}')
+            print(f'Plots completed in the last 24 hours:                  {yellow}{server["plots_last_day"]}{nc}')
+            print(f'Average Plotting Speed Last 24 Hours (Tib/Day):        {yellow}{server["avg_plotting_speed"]}{nc}')
+            print(f'Appx # of Days to replace all plots on {green}{server["server"]}{nc}:      {yellow}{server["approx_days_to_fill_drives"]}{nc}')
+            print(f'{blue}############################################################{nc}')
+        else:
+            print(f'Replace Non-Pool Plots:                             {red}Disabled{nc}')
+            print(f'Total number of plots on {green}{server["server"]}{nc}:                    {yellow}{server["total_plots"]}{nc}')
+            print(f'Plots completed in the last 24 hours:                  {yellow}{server["plots_last_day"]}{nc}')
+            print(f'Average Plotting Speed Last 24 Hours (Tib/Day):        {yellow}{server["avg_plotting_speed"]}{nc}')
+            print(f'Appx # of Days to fill all drives on this harvester:   {yellow}{server["approx_days_to_fill_drives"]}{nc}')
+            print(f'{blue}############################################################{nc}')
+
+
+def uuid_report(uuid):
+    print()
+    print(f'Please wait while we search all harvesters for {green}{uuid}{nc}')
+    uuid_search_results = uuid_search(uuid)
+    if not uuid_search_results:
+        print()
+        print(f'{blue}############################################################{nc}')
+        print(f'{blue}################### {green}UUID Search Report{blue} #####################{nc}')
+        print(f'{blue}############################################################{nc}')
+        print(f'UUID:          {green}{uuid}{nc}')
+        print(f'Status:        {red}NOT LOCATED{nc}')
+        print(f'{blue}############################################################{nc}')
+        print()
+        print()
+    else:
+        server = uuid_search_results[0]
+        mountpoint = uuid_search_results[1]
+        print()
+        print(f'{blue}############################################################{nc}')
+        print(f'{blue}################### {green}UUID Search Report{blue} #####################{nc}')
+        print(f'{blue}############################################################{nc}')
+        print(f'UUID:          {green}{uuid}{nc}')
+        print(f'Status:        {yellow}LOCATED{nc}')
+        print(f'Harvester:     {yellow}{server}{nc}')
+        print(f'Mount Point:   {yellow}{mountpoint}{nc}')
+        print(f'{blue}############################################################{nc}')
+        print()
+        print()
+
 
 def nas_report_export():
     """
@@ -869,22 +1311,76 @@ def nas_report_export():
     health checks. Used to pass information on to our plotter as well.
     """
     log.debug('nas_report_export() started')
+    chianas = DriveManager.read_configs() #reread in case of changes
+    chiaplots = PlotManager.get_plot_info() #reread in case of changes
     plots_last_day = chianas.current_total_plots_daily
     if plots_last_day == 0:
         plots_last_day = 1
+    # We are REPLACING old plots, we ARE NOT filling empty drives first AND we have some old plots to replace. (Trigger 1)
+    if chianas.replace_non_pool_plots and not chianas.fill_empty_drives_first and chiaplots.number_of_old_plots > 1:
+        total_plots_until_full = ((int(get_all_available_system_space("free")[1]) - chianas.empty_drives_low_water_mark) + int(chiaplots.number_of_old_plots))
+        current_plot_replacement_drive = chiaplots.plot_drive
+        approx_days_to_fill_drives = round((int(total_plots_until_full / plots_last_day)), 0)
+        free_space_available = False
+        total_empty_space_plots_until_full = 0
+        replace_non_pool_plots = True # We want to trigger deleting a plot since we want to replace old plots first.
+        trigger = '1'
+    # We are REPLACING old plots, but we want to fill empty drive space FIRST and we have EMPTY drive space to fill. (Trigger 2)
+    elif chianas.replace_non_pool_plots and chianas.fill_empty_drives_first and (get_all_available_system_space("free")[1]) > chianas.empty_drives_low_water_mark:
+        total_plots_until_full = (int(get_all_available_system_space("free")[1]) + int(chiaplots.number_of_old_plots))
+        current_plot_replacement_drive = chiaplots.plot_drive
+        approx_days_to_fill_drives = round((int(total_plots_until_full / plots_last_day)), 0)
+        free_space_available = True
+        total_empty_space_plots_until_full = (int(get_all_available_system_space("free")[1]) - chianas.empty_drives_low_water_mark)
+        replace_non_pool_plots = False # In this case we do NOT want to trigger deleting a plot since we are going to fill the empty space first.
+        trigger = '2'
+    # We are REPLACING old plots, but we want to fill empty drive space FIRST but we have NO EMPTY drive space left to fill. (Trigger 3)
+    elif chianas.replace_non_pool_plots and chianas.fill_empty_drives_first and not (get_all_available_system_space("free")[1]) > chianas.empty_drives_low_water_mark:
+        total_plots_until_full = (int(chiaplots.number_of_old_plots))
+        current_plot_replacement_drive = chiaplots.plot_drive
+        approx_days_to_fill_drives = round((int(total_plots_until_full / plots_last_day)), 0)
+        free_space_available = False
+        total_empty_space_plots_until_full = 0
+        replace_non_pool_plots = True  # We want to trigger deleting a plot since we have no empty drive space to fill.
+        trigger = '3'
+    # We are NOT replacing old plots, and we have empty drive space left. (Trigger 4)
+    elif (get_all_available_system_space("free")[1]) > chianas.empty_drives_low_water_mark:
+        total_plots_until_full = (int(get_all_available_system_space("free")[1]) - chianas.empty_drives_low_water_mark)
+        current_plot_replacement_drive = 'N/A'
+        approx_days_to_fill_drives = round((int(total_plots_until_full / plots_last_day)), 0)
+        free_space_available = True
+        total_empty_space_plots_until_full = (int(get_all_available_system_space("free")[1]) - chianas.empty_drives_low_water_mark)
+        replace_non_pool_plots = False
+        trigger = '4'
+    # We are NOT replacing old plots, and we have NO empty drive space left. (Trigger 5)
+    else:
+        total_plots_until_full = (int(get_all_available_system_space("free")[1] - chianas.empty_drives_low_water_mark))
+        current_plot_replacement_drive = 'N/A'
+        approx_days_to_fill_drives = round((int(total_plots_until_full / plots_last_day)), 0)
+        free_space_available = False
+        total_empty_space_plots_until_full = (int(get_all_available_system_space("free")[1]) - chianas.empty_drives_low_water_mark)
+        replace_non_pool_plots = False
+        trigger = '5'
     nas_server_export = dict([
         ('server', chianas.hostname),
         ('total_plots', int(get_all_available_system_space("used")[1])),
         ('total_plots_farming', int(check_plots()[0])),
         ('total_tib_farming', int(check_plots()[1])),
         ('total_plot_drives', int(get_all_available_system_space("total")[0])),
-        ('total_plots_until_full', int(get_all_available_system_space("free")[1])),
+        ('total_plots_until_full', total_plots_until_full),
+        ('total_empty_space_plots_until_full', total_empty_space_plots_until_full),
+        ('free_space_available', free_space_available),
         ('max_plots_when_full', int(get_all_available_system_space("total")[1])),
         ('plots_last_day', plots_last_day),
         ('avg_plots_per_hour', round((int(chianas.current_total_plots_daily)) / 24, 1)),
         ('avg_plotting_speed', round((int(chianas.current_total_plots_daily)) * int(plot_size_g) / 1000, 2)),
-        ('approx_days_to_fill_drives', (int(get_all_available_system_space('free')[1] / plots_last_day))),
-        ('current_plot_drive', chianas.current_plotting_drive)
+        ('approx_days_to_fill_drives', approx_days_to_fill_drives),
+        ('current_plot_drive', chianas.current_plotting_drive),
+        ('replace_non_pool_plots', replace_non_pool_plots),
+        ('total_number_of_old_plots', chiaplots.number_of_old_plots),
+        ('current_plot_replacement_drive', current_plot_replacement_drive),
+        ('total_number_of_portable_plots', chiaplots.number_of_portable_plots),
+        ('trigger', trigger)
     ])
     try:
         with open(local_export_file, 'w') as nas_export:
@@ -892,6 +1388,23 @@ def nas_report_export():
     except:
         log.debug(f'Unable to write to export file! Check \"{local_export_file}\" path above and try again!')
     return nas_server_export
+
+
+def generate_uuid_dict():
+   result = subprocess.run(['lsblk', '-nolabel', '-o', 'UUID,MOUNTPOINT'], capture_output=True)
+   fstab_dict = []
+   for item in result.stdout.splitlines():
+       if b'enclosure' not in item: continue
+       uuid, mnt = item.decode().split()
+       fstab_dict.append((uuid, (chianas.hostname, mnt)))
+   try:
+       dsks = dict()
+       dsks.update(fstab_dict)
+       with open(uuid_export_file, 'w') as uuid_export:
+           json.dump(dsks, uuid_export)
+   except Exception:
+       log.debug(f'Unable to write to export file! Check \"{uuid_export_file}\" path above and try again!')
+       raise
 
 
 def temperature_report():
@@ -910,16 +1423,27 @@ def temperature_report():
     print('')
     print('')
 
-# You should run this once per day to sse total daily plots
+# You should run this once per day to see total daily plots
 # in your reports. If you run it more often, the numbers will
 # not be correct. I use midnight here for my purposes, but
 # this is just a var name.
 def update_daily_plot_counts():
-    current_total_plots_midnight = chianas.current_total_plots_midnight
-    total_serverwide_plots = int(get_all_available_system_space('used')[1])
-    chianas.update_current_total_plots_midnight(total_serverwide_plots)
-    total_plots_daily = (total_serverwide_plots - current_total_plots_midnight)
-    chianas.update_current_total_plots_daily(total_plots_daily)
+    if not chianas.pools:
+        current_total_plots_midnight = chianas.current_total_plots_midnight # Old plots if converting to new portable plots
+        total_serverwide_plots = int(get_all_available_system_space('used')[1]) # Total number of plots on the server as a whole, old and new
+        chianas.update_current_total_plots_midnight('old', total_serverwide_plots) # New Midnight TOTAL server plots, old and portable
+        total_plots_daily = (total_serverwide_plots - current_total_plots_midnight)
+        chianas.update_current_total_plots_daily('old', total_plots_daily)
+    else:
+        current_portable_plots_midnight = chianas.current_portable_plots_midnight
+        total_serverwide_portable_plots = chiaplots.number_of_portable_plots
+        total_serverwide_plots = int(get_all_available_system_space('used')[1])  # Total number of plots on the server as a whole, old and new
+        chianas.update_current_total_plots_midnight('old', total_serverwide_plots)  # New Midnight TOTAL server plots, old and portable
+        chianas.update_current_total_plots_midnight('portable', total_serverwide_portable_plots)  # New Midnight TOTAL server plots, old and portable
+        total_plots_daily = (total_serverwide_portable_plots - current_portable_plots_midnight)
+        chianas.update_current_total_plots_daily('old', total_plots_daily)
+        chianas.update_current_total_plots_daily('portable', total_plots_daily)
+
 
 def send_email(recipient, subject, body):
     """
@@ -1067,7 +1591,7 @@ def check_temp_drive_utilization():
             chianas.toggle_alert_sent('temp_dirs_critical_alert_sent')
             notify('INFORMATION: Directory Utilization', 'INFORMATION: Your Temp Directory is now below High Capacity Warning\nPlotting will Continue')
         else:
-            log.debug('Temp Drive(s) check complete. ALl OK!')
+            log.debug('Temp Drive(s) check complete. All OK!')
 
     else:
         log.debug('Local Plotting is Disabled. No Drive Checks.')
@@ -1096,7 +1620,7 @@ def check_dst_drive_utilization():
             chianas.toggle_alert_sent('dst_dirs_critical_alert_sent')
             notify('INFORMATION: Directory Utilization', 'INFORMATION: Your Temp Directory is now below High Capacity Warning\nPlotting will Continue')
         else:
-            log.debug('DST Drive(s) check complete. ALl OK!')
+            log.debug('DST Drive(s) check complete. All OK!')
     else:
         log.debug('Local Plotting is Disabled. No Drive Checks.')
 
@@ -1114,7 +1638,7 @@ def checks_plots_available():
         notify('INFORMATION: Total Plots Available',
                'INFORMATION: Your Total Plots available is now Above the Warning Limit\nPlotting will Continue')
     else:
-        log.debug('Plot check complete. ALl OK!')
+        log.debug('Plot check complete. All OK!')
 
 
 def checkIfProcessRunning(processName):
@@ -1140,8 +1664,8 @@ def system_checks():
     check_dst_drive_utilization()
     checks_plots_available()
 
-
 def main():
+    log.debug(f'Welcome to drive_manager.py Version: {VERSION}')
     are_we_configured()
     parser = init_argparser()
     args = parser.parse_args()
@@ -1155,28 +1679,27 @@ def main():
         update_daily_plot_counts()
     elif args.check_temps:
         temperature_report()
+    elif args.check_uuid:
+        uuid_report(args.check_uuid)
     elif args.offline_hdd:
         online_offline_drive(args.offline_hdd, 'offline')
+    elif args.replace_plot:
+        replace_plot()
     elif get_offlined_drives():
         if args.online_hdd:
             online_offline_drive(args.online_hdd, 'online')
         else:
-            config_file_update()
             system_checks()
             nas_report_export()
+            generate_uuid_dict()
             send_new_plot_notification()
-            if chianas.local_plotter:
-                update_move_local_plot()
             update_receive_plot()
     else:
-        config_file_update()
         system_checks()
         nas_report_export()
+        generate_uuid_dict()
         send_new_plot_notification()
-        if chianas.local_plotter:
-            update_move_local_plot()
         update_receive_plot()
 
-                   
 if __name__ == '__main__':
     main()

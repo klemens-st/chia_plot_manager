@@ -6,7 +6,7 @@ Part of drive_manager. These classes are for reading and updating out yaml
 config file.
 """
 
-VERSION = "V0.92 (2021-06-07)"
+VERSION = "V0.96 (2021-09-05)"
 
 import os
 import yaml
@@ -18,6 +18,10 @@ from shutil import copyfile
 from flatten_dict import flatten
 from flatten_dict import unflatten
 from datetime import datetime
+from glob import glob
+import os
+from os.path import abspath
+from natsort import natsorted
 
 script_path = Path(__file__).parent.resolve()
 
@@ -36,53 +40,25 @@ level = logging._checkLevel(level)
 log = logging.getLogger('drivemanager_classes.py')
 log.setLevel(level)
 
-def config_file_update():
-    """
-    Function to determine if we need to update our yaml configuration file after an upgrade.
-    """
-    log.debug('config_file_update() Started....')
-    if os.path.isfile(skel_config_file):
-        with open(config_file, 'r') as current_config:
-            current_config = yaml.safe_load(current_config)
-        with open(skel_config_file, 'r') as temp_config:
-            temp_config = yaml.safe_load(temp_config)
-        temp_current_config = flatten(current_config)
-        temp_temp_config = flatten(temp_config)
-        updates = (dict((k, v) for k, v in temp_temp_config.items() if k not in temp_current_config))
-        if updates != {}:
-            copyfile(skel_config_file, (str(Path.home()) + '/.config/plot_manager/Config_Instructions.yaml'))
-            copyfile(config_file, (str(Path.home()) + f'/.config/plot_manager/plot_manager.yaml.{current_military_time}'))
-            temp_current_config.update(updates)
-            new_config = (dict((k, v) for k, v in temp_current_config.items() if k in temp_temp_config))
-        else:
-            new_config = (dict((k, v) for k, v in temp_current_config.items() if k not in temp_temp_config))
-        if new_config != {}:
-            new_config = (dict((k, v) for k, v in temp_current_config.items() if k in temp_temp_config))
-            current_config = unflatten(new_config)
-            current_config.update({'configured': False})
-            with open((str(Path.home()) + '/.config/plot_manager/plot_manager.yaml'), 'w') as f:
-                yaml.safe_dump(current_config, f)
-            log.debug(f'Config File: {config_file} updated. Update as necessary to run this script.')
-            exit()
-        else:
-            log.debug('No config file changes necessary! No changes made.')
-    else:
-        log.debug('New configuration file not found. No changes made.')
-
-
 class DriveManager:
     if not os.path.isfile(config_file):
         log.debug(f'Plot_Manager config file does not exist at: {config_file}')
         log.debug("Please check file path and try again.")
         exit()
     else:
-        def __init__(self, configured, hostname, chia_log_file, chia_config_file, remote_harvester_reports, remote_harvesters,
-                     notifications, pb, email, sms, daily_update, new_plot_drive, per_plot, local_plotter, temp_dirs, temp_dirs_critical,
-                     temp_dirs_critical_alert_sent, dst_dirs, dst_dirs_critical, dst_dirs_critical_alert_sent, warnings, emails, phones,
-                     twilio_from, twilio_account, twilio_token, pb_api, current_internal_drive, current_plotting_drive, total_plot_highwater_warning,
-                     total_plots_alert_sent, current_total_plots_midnight, current_total_plots_daily, offlined_drives, logging, log_level):
+        def __init__(self, configured, hostname, pools, replace_non_pool_plots, fill_empty_drives_first, empty_drives_low_water_mark, chia_log_file, chia_config_file,
+                     remote_harvester_reports, remote_harvesters, notifications, pb, email, sms, daily_update, new_plot_drive, per_plot,
+                     local_plotter, temp_dirs, temp_dirs_critical, temp_dirs_critical_alert_sent, dst_dirs, dst_dirs_critical,
+                     dst_dirs_critical_alert_sent, warnings, emails, phones, twilio_from, twilio_account, twilio_token, pb_api,
+                     current_internal_drive, current_plotting_drive, total_plot_highwater_warning, total_plots_alert_sent, plot_receive_interface_threshold,
+                     current_total_plots_midnight, current_total_plots_daily, offlined_drives, logging, log_level, plot_receive_interface,
+                     current_portable_plots_midnight, current_portable_plots_daily, current_plot_replacement_drive, local_move_error, local_move_error_alert_sent):
             self.configured = configured
             self.hostname = hostname
+            self.pools = pools
+            self.replace_non_pool_plots = replace_non_pool_plots
+            self.fill_empty_drives_first = fill_empty_drives_first
+            self.empty_drives_low_water_mark = empty_drives_low_water_mark
             self.chia_log_file = chia_log_file
             self.chia_config_file = chia_config_file
             self.remote_harvester_reports = remote_harvester_reports
@@ -112,11 +88,18 @@ class DriveManager:
             self.current_plotting_drive = current_plotting_drive
             self.total_plot_highwater_warning = total_plot_highwater_warning
             self.total_plots_alert_sent = total_plots_alert_sent
+            self.current_portable_plots_midnight = current_portable_plots_midnight
+            self.current_portable_plots_daily = current_portable_plots_daily
             self.current_total_plots_midnight = current_total_plots_midnight
             self.current_total_plots_daily = current_total_plots_daily
             self.offlined_drives = offlined_drives
             self.logging = logging
             self.log_level = log_level
+            self.plot_receive_interface = plot_receive_interface
+            self.plot_receive_interface_threshold = plot_receive_interface_threshold
+            self.current_plot_replacement_drive = current_plot_replacement_drive
+            self.local_move_error = local_move_error
+            self.local_move_error_alert_sent = local_move_error_alert_sent
 
         @classmethod
         def read_configs(cls):
@@ -125,6 +108,10 @@ class DriveManager:
                 return cls(
                     configured=server['configured'],
                     hostname=server['hostname'],
+                    pools=server['pools']['active'],
+                    replace_non_pool_plots=server['pools']['replace_non_pool_plots'],
+                    fill_empty_drives_first=server['pools']['fill_empty_drives_first'],
+                    empty_drives_low_water_mark=server['pools']['empty_drives_low_water_mark'],
                     chia_log_file=server['chia_log_file'],
                     chia_config_file=server['chia_config_file'],
                     remote_harvester_reports=server['remote_harvester_reports']['active'],
@@ -156,26 +143,45 @@ class DriveManager:
                     total_plots_alert_sent=server['harvester']['total_plots_alert_sent'],
                     current_total_plots_midnight=server['harvester']['current_total_plots_midnight'],
                     current_total_plots_daily=server['harvester']['current_total_plots_daily'],
+                    current_portable_plots_midnight=server['pools']['current_portable_plots_midnight'],
+                    current_portable_plots_daily=server['pools']['current_portable_plots_daily'],
                     offlined_drives=server['harvester']['offlined_drives'],
                     logging=server['logging'],
-                    log_level=server['log_level'])
+                    log_level=server['log_level'],
+                    plot_receive_interface=server['plot_receive_interface'],
+                    plot_receive_interface_threshold=server['plot_receive_interface_threshold'],
+                    current_plot_replacement_drive=server['pools']['current_plot_replacement_drive'],
+                    local_move_error=server['local_plotter']['local_move_error'],
+                    local_move_error_alert_sent=server['local_plotter']['local_move_error_alert_sent'])
 
 
         def toggle_notification(self, notification):
             if getattr(self, notification):
-                print('Changing to False')
                 with open (config_file) as f:
                     server = yaml.safe_load(f)
                     server['notifications']['methods'][notification] = False
                     with open('plot_manager.yaml', 'w') as f:
                         yaml.safe_dump(server, f)
             else:
-                print ('Changing to True')
                 with open(config_file) as f:
                     server = yaml.safe_load(f)
                     server['notifications']['methods'][notification] = True
                     with open(config_file, 'w') as f:
                         yaml.safe_dump(server, f)
+
+        def set_local_move_error(self):
+            if getattr(self, 'local_move_error'):
+                log.debug('local_move_error already set to True! Nothing to do here.')
+                pass
+            else:
+                with open(config_file) as f:
+                    server = yaml.safe_load(f)
+                    server['local_plotter']['local_move_error'] = True
+                    with open(config_file, 'w') as f:
+                        yaml.safe_dump(server, f)
+                log.debug('local_move_error toggled to True!')
+
+
 
         def set_notification(self, notification, value):
             if getattr(self, notification) == value:
@@ -201,17 +207,30 @@ class DriveManager:
                 with open(config_file, 'w') as f:
                     yaml.safe_dump(server, f)
 
-        def update_current_total_plots_midnight(self, plots):
+        def update_current_plot_replacement_drive(self, new_drive):
             with open(config_file) as f:
                 server = yaml.safe_load(f)
-                server['harvester']['current_total_plots_midnight'] = plots
+                server['pools']['current_plot_replacement_drive'] = new_drive
                 with open(config_file, 'w') as f:
                     yaml.safe_dump(server, f)
 
-        def update_current_total_plots_daily(self, plots):
+        def update_current_total_plots_midnight(self, type, plots):
             with open(config_file) as f:
                 server = yaml.safe_load(f)
-                server['harvester']['current_total_plots_daily'] = plots
+                if type == 'old':
+                    server['harvester']['current_total_plots_midnight'] = plots
+                else:
+                    server['pools']['current_portable_plots_midnight'] = plots
+                with open(config_file, 'w') as f:
+                    yaml.safe_dump(server, f)
+
+        def update_current_total_plots_daily(self, type, plots):
+            with open(config_file) as f:
+                server = yaml.safe_load(f)
+                if type == 'old':
+                    server['harvester']['current_total_plots_daily'] = plots
+                else:
+                    server['pools']['current_portable_plots_daily'] = plots
                 with open(config_file, 'w') as f:
                     yaml.safe_dump(server, f)
 
@@ -256,14 +275,12 @@ class DriveManager:
         def toggle_alert_sent(self, alert):
             if alert == 'temp_dirs_critical_alert_sent':
                 if getattr(self, alert):
-                    print('Changing to False')
                     with open (config_file) as f:
                         server = yaml.safe_load(f)
                         server['local_plotter']['temp_dirs']['critical_alert_sent'] = False
                         with open(config_file, 'w') as f:
                             yaml.safe_dump(server, f)
                 else:
-                    print ('Changing to True')
                     with open(config_file) as f:
                         server = yaml.safe_load(f)
                         server['local_plotter']['temp_dirs']['critical_alert_sent'] = True
@@ -272,14 +289,12 @@ class DriveManager:
 
             elif alert == 'dst_dirs_critical_alert_sent':
                 if getattr(self, alert):
-                    print('Changing to False')
                     with open (config_file) as f:
                         server = yaml.safe_load(f)
                         server['local_plotter']['dst_dirs']['critical_alert_sent'] = False
                         with open(config_file, 'w') as f:
                             yaml.safe_dump(server, f)
                 else:
-                    print ('Changing to True')
                     with open(config_file) as f:
                         server = yaml.safe_load(f)
                         server['local_plotter']['dst_dirs']['critical_alert_sent'] = True
@@ -288,20 +303,95 @@ class DriveManager:
 
             elif alert == 'total_plots_alert_sent':
                 if getattr(self, alert):
-                    print('Changing to False')
                     with open(config_file) as f:
                         server = yaml.safe_load(f)
                         server['harvester']['total_plots_alert_sent'] = False
                         with open(config_file, 'w') as f:
                             yaml.safe_dump(server, f)
                 else:
-                    print ('Changing to True')
                     with open(config_file) as f:
                         server = yaml.safe_load(f)
                         server['harvester']['total_plots_alert_sent'] = True
                         with open(config_file, 'w') as f:
                             yaml.safe_dump(server, f)
 
+            elif alert == 'local_move_error_alert_sent':
+                if getattr(self, alert):
+                    with open(config_file) as f:
+                        server = yaml.safe_load(f)
+                        server['local_plotter']['local_move_error_alert_sent'] = False
+                        with open(config_file, 'w') as f:
+                            yaml.safe_dump(server, f)
+                    log.debug('local_move_error_alert_sent set to FALSE')
+                else:
+                    with open(config_file) as f:
+                        server = yaml.safe_load(f)
+                        server['local_plotter']['local_move_error_alert_sent'] = True
+                        with open(config_file, 'w') as f:
+                            yaml.safe_dump(server, f)
+                    log.debug('local_move_error_alert_sent set to TRUE')
+
+class PlotManager:
+    def __init__(self, plots_to_replace, number_of_old_plots, number_of_portable_plots, plot_drive,
+                 next_plot_to_replace, next_local_plot_to_replace, local_plot_drive):
+        self.plots_to_replace = plots_to_replace
+        self.number_of_old_plots = number_of_old_plots
+        self.number_of_portable_plots = number_of_portable_plots
+        self.plot_drive = plot_drive
+        self.next_plot_to_replace = next_plot_to_replace
+        self.next_local_plot_to_replace = next_local_plot_to_replace
+        self.local_plot_drive = local_plot_drive
+
+    @classmethod
+    def get_plot_info(cls):
+        return cls(
+        plots_to_replace = number_of_plots_in_system('old')[1],
+        number_of_old_plots = number_of_plots_in_system('old')[0],
+        number_of_portable_plots = number_of_plots_in_system('portable')[0],
+        plot_drive = os.path.dirname(str(get_next_plot_replacement('old')[0])),
+        next_plot_to_replace= str(get_next_plot_replacement('old')[0]),
+        next_local_plot_to_replace = str(get_next_plot_replacement('local')[0]),
+        local_plot_drive = os.path.dirname(str(get_next_plot_replacement('local')[0])))
+
+def get_next_plot_replacement(type):
+    if type == 'old':
+        try:
+            file_path_glob = '/mnt/enclosure[0-9]/*/column[0-9]/*/plot-*'
+            d = {abspath(d): d for d in glob(file_path_glob)}
+            old_plot_count = len(d)
+            return natsorted([p for p in d])[0], old_plot_count
+        except IndexError:
+            return False, 0
+    elif type == 'portable':
+        try:
+            file_path_glob = '/mnt/enclosure[0-9]/*/column[0-9]/*/portable*'
+            d = {abspath(d): d for d in glob(file_path_glob)}
+            old_plot_count = len(d)
+            return natsorted([p for p in d])[0], old_plot_count
+        except IndexError:
+            return False, 0
+    else:
+        try:
+            file_path_glob = '/mnt/enclosure[0-9]/*/column[0-9]/*/plot-*'
+            d = {abspath(d): d for d in glob(file_path_glob)}
+            old_plot_count = len(d)
+            return natsorted([p for p in d], reverse=True)[0], old_plot_count
+        except IndexError:
+            return False, 0
+
+def number_of_plots_in_system(type):
+    if type == 'old':
+        plots_left = get_next_plot_replacement('old')
+        if not plots_left[0]:
+            return 0, False
+        else:
+            return plots_left[1], True
+    else:
+        plots_left = get_next_plot_replacement('portable')
+        if not plots_left[0]:
+            return 0, False
+        else:
+            return plots_left[1], True
 
 
 def main():
