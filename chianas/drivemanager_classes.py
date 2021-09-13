@@ -356,7 +356,7 @@ class PlotManager:
 def get_next_plot_replacement(type):
     if type == 'old':
         try:
-            file_path_glob = '/mnt/enclosure[0-9]/*/column[0-9]/*/plot-*'
+            file_path_glob = '/mnt/enclosure[0-9]/*/plot-*'
             d = {abspath(d): d for d in glob(file_path_glob)}
             old_plot_count = len(d)
             return natsorted([p for p in d])[0], old_plot_count
@@ -364,7 +364,7 @@ def get_next_plot_replacement(type):
             return False, 0
     elif type == 'portable':
         try:
-            file_path_glob = '/mnt/enclosure[0-9]/*/column[0-9]/*/portable*'
+            file_path_glob = '/mnt/enclosure[0-9]/*/portable*'
             d = {abspath(d): d for d in glob(file_path_glob)}
             old_plot_count = len(d)
             return natsorted([p for p in d])[0], old_plot_count
@@ -372,7 +372,7 @@ def get_next_plot_replacement(type):
             return False, 0
     else:
         try:
-            file_path_glob = '/mnt/enclosure[0-9]/*/column[0-9]/*/plot-*'
+            file_path_glob = '/mnt/enclosure[0-9]/*/plot-*'
             d = {abspath(d): d for d in glob(file_path_glob)}
             old_plot_count = len(d)
             return natsorted([p for p in d], reverse=True)[0], old_plot_count
