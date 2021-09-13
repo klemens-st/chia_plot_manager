@@ -1691,13 +1691,13 @@ def main():
         else:
             system_checks()
             nas_report_export()
-            generate_uuid_dict()
+            # generate_uuid_dict()
             send_new_plot_notification()
             update_receive_plot()
     else:
         system_checks()
         nas_report_export()
-        generate_uuid_dict()
+        # generate_uuid_dict()
         send_new_plot_notification()
         update_receive_plot()
 
