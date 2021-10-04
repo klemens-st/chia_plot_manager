@@ -813,7 +813,7 @@ def replace_plot():
                 print('No further old plots to replace!!')
                 update_receive_plot()
         else:
-            if (get_all_available_system_space("free")[1]) < chianas.empty_drives_low_water_mark: # Do we have an empty drive space left?
+            if (get_all_available_system_space("free")[1]) <= chianas.empty_drives_low_water_mark: # Do we have an empty drive space left?
                 if chiaplots.plots_to_replace:
                     if check_space_available(chiaplots.plot_drive):
                         log.debug(f'We have {chiaplots.number_of_old_plots} plots to replace.')
